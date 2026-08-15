@@ -1,0 +1,37 @@
+name: Build Buzz ACP Windows fallback
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Add Rust target
+        shell: bash
+        run: rustup target add "$TARGET"
+      - name: Format check
+        shell: bash
+        run: cargo fmt --all -- --check
+      - name: Test buzz-acp
+        shell: bash
+        run: cargo test -p buzz-acp
+      - name: Build buzz-acp
+        shell: bash
+        run: cargo build --release --target "$TARGET" -p buzz-acp
+      - name: Upload buzz-acp
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-acp-windows-${{ github.sha }}
+          path: target/${{ env.TARGET }}/release/buzz-acp.exe
+          if-no-files-found: error
+          retention-days: 7

@@ -218,6 +218,10 @@ pub struct AcpClient {
     /// `session/prompt` request. The harness uses this as a last-resort reply
     /// body when an adapter cannot invoke the Buzz CLI itself.
     turn_agent_message: String,
+    /// ACP message identifier for the retained assistant segment. A turn may
+    /// contain several model rounds separated by tools; only the final round
+    /// is safe to publish as the user-facing fallback.
+    turn_agent_message_id: Option<String>,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -568,6 +572,7 @@ impl AcpClient {
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
             turn_agent_message: String::new(),
+            turn_agent_message_id: None,
         })
     }
 
@@ -790,6 +795,7 @@ impl AcpClient {
         // user turn. Keep only the chunks emitted by this prompt so the
         // harness fallback never republishes stale setup output.
         self.turn_agent_message.clear();
+        self.turn_agent_message_id = None;
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -1764,12 +1770,22 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
+                    if let Some(message_id) = update.get("messageId").and_then(|v| v.as_str()) {
+                        if self.turn_agent_message_id.as_deref() != Some(message_id) {
+                            self.turn_agent_message.clear();
+                            self.turn_agent_message_id = Some(message_id.to_string());
+                        }
+                    }
                     self.turn_agent_message.push_str(text);
                     tracing::info!(target: "acp::stream", "{text}");
                 }
                 false
             }
             "tool_call" => {
+                // Text before a tool call is intermediate narration, not the
+                // final answer. Retain only chunks emitted after the last tool.
+                self.turn_agent_message.clear();
+                self.turn_agent_message_id = None;
                 let title = update
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -1865,6 +1881,7 @@ impl AcpClient {
 
     /// Take the text emitted by the most recent `session/prompt` turn.
     pub(crate) fn take_turn_agent_message(&mut self) -> String {
+        self.turn_agent_message_id = None;
         std::mem::take(&mut self.turn_agent_message)
     }
 
@@ -3120,6 +3137,33 @@ mod tests {
             Ok(StopReason::EndTurn)
         ));
         assert_eq!(client.take_turn_agent_message(), "next");
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prompt_agent_message_keeps_only_final_segment_after_tool_and_message_change() {
+        let script = r#"
+            read -r _prompt
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"round-1","content":{"text":"I will inspect this."}}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","title":"inspect","kind":"other"}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"round-2","content":{"text":"Final "}}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"round-2","content":{"text":"answer"}}}}'
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+        "#;
+        let mut client = spawn_script(script).await;
+
+        assert!(matches!(
+            client
+                .session_prompt_with_idle_timeout(
+                    "session",
+                    "prompt",
+                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_secs(5),
+                )
+                .await,
+            Ok(StopReason::EndTurn)
+        ));
+        assert_eq!(client.take_turn_agent_message(), "Final answer");
         client.shutdown().await;
     }
 

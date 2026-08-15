@@ -3853,10 +3853,7 @@ fn handle_prompt_result(
     // let the authenticated harness publish it — but only after the relay-side
     // duplicate check in `post_agent_reply_fallback` confirms the agent did not
     // already send a message itself.
-    let fallback = if matches!(
-        &result.outcome,
-        PromptOutcome::Ok(acp::StopReason::EndTurn | acp::StopReason::Refusal)
-    ) {
+    let fallback = if matches!(&result.outcome, PromptOutcome::Ok(acp::StopReason::EndTurn)) {
         let content = result.agent.acp.take_turn_agent_message();
         result
             .agent
