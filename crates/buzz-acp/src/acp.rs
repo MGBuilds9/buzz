@@ -2044,7 +2044,11 @@ impl AcpClient {
                 ))
             })?;
 
-        let response = if reject_required {
+        let selected_reject = options.iter().any(|option| {
+            option.get("kind").and_then(|kind| kind.as_str()) == Some("reject_once")
+                && option.get("optionId").and_then(|id| id.as_str()) == Some(option_id)
+        });
+        let response = if selected_reject {
             tracing::info!(
                 target: "acp::permission",
                 mode = %self.permission_mode,
@@ -2737,6 +2741,37 @@ mod tests {
     }
 
     #[test]
+    fn dont_ask_permission_mode_never_falls_back_to_allow_once() {
+        let options = serde_json::json!([
+            {"kind": "allow_once", "optionId": "allow-this-turn"}
+        ]);
+
+        assert_eq!(
+            permission_option_for_mode(
+                options.as_array().expect("permission options"),
+                crate::config::PermissionMode::DontAsk,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn plan_permission_mode_selects_reject_once() {
+        let options = serde_json::json!([
+            {"kind": "allow_once", "optionId": "allow-this-turn"},
+            {"kind": "reject_once", "optionId": "reject-this-turn"}
+        ]);
+
+        assert_eq!(
+            permission_option_for_mode(
+                options.as_array().expect("permission options"),
+                crate::config::PermissionMode::Plan,
+            ),
+            Some("reject-this-turn")
+        );
+    }
+
+    #[test]
     fn session_cancel_notification_has_session_id_in_params() {
         let session_id = "sess_xyz789";
         let msg = serde_json::json!({
@@ -3076,6 +3111,42 @@ mod tests {
         AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
             .await
             .expect("failed to spawn test script")
+    }
+
+    #[tokio::test]
+    async fn dont_ask_permission_mode_writes_reject_once_wire_response() {
+        let mut client = spawn_script("IFS= read -r line; printf '%s\\n' \"$line\"").await;
+        client.set_permission_mode(crate::config::PermissionMode::DontAsk);
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "permission-live-path",
+            "method": "session/request_permission",
+            "params": {
+                "options": [
+                    {"kind": "allow_once", "optionId": "allow-this-turn"},
+                    {"kind": "reject_once", "optionId": "reject-this-turn"}
+                ]
+            }
+        });
+
+        client
+            .handle_permission_request(&request)
+            .await
+            .expect("permission response");
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), client.reader.next())
+            .await
+            .expect("wire response timeout")
+            .expect("wire response line")
+            .expect("wire response decode");
+        let response: serde_json::Value = serde_json::from_str(&line).expect("response JSON");
+
+        assert_eq!(response["id"], "permission-live-path");
+        assert_eq!(
+            response["result"]["outcome"]["optionId"],
+            "reject-this-turn"
+        );
+        assert!(client.permission_responded);
+        assert!(client.pending_permission_id.is_none());
     }
 
     #[cfg(unix)]
