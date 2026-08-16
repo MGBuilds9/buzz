@@ -2681,6 +2681,21 @@ mod tests {
     }
 
     #[test]
+    fn dont_ask_permission_mode_selects_reject_once() {
+        let options = serde_json::json!([
+            {"kind": "allow_once", "optionId": "allow-this-turn"},
+            {"kind": "reject_once", "optionId": "reject-this-turn"}
+        ]);
+        let selected = permission_option_for_mode(
+            options.as_array().expect("permission options"),
+            crate::config::PermissionMode::DontAsk,
+        )
+        .expect("dontAsk must select an explicit rejection");
+
+        assert_eq!(selected, "reject-this-turn");
+    }
+
+    #[test]
     fn session_cancel_notification_has_session_id_in_params() {
         let session_id = "sess_xyz789";
         let msg = serde_json::json!({
