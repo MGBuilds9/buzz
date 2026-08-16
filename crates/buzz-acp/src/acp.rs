@@ -13,6 +13,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
+use crate::config::PermissionMode;
 use crate::observer::{ObserverContext, ObserverHandle};
 use crate::usage::{
     PromptResponseUsage, StandardAdapterKind, StandardUsageTracker, TurnUsage, UsageTracker,
@@ -164,6 +165,9 @@ pub struct AcpClient {
     /// Guards against double-response if a timeout fires after the allow_once
     /// response was written but before `pending_permission_id` was cleared.
     permission_responded: bool,
+    /// Harness permission policy. This remains authoritative even when an ACP
+    /// adapter does not advertise a matching `session/set_config_option` mode.
+    permission_mode: PermissionMode,
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
@@ -568,6 +572,7 @@ impl AcpClient {
             next_id: 0,
             pending_permission_id: None,
             permission_responded: false,
+            permission_mode: PermissionMode::Default,
             last_prompt_id: None,
             current_hard_deadline: None,
             observer: None,
@@ -589,6 +594,11 @@ impl AcpClient {
     pub fn set_observer(&mut self, observer: Option<ObserverHandle>, agent_index: usize) {
         self.observer = observer;
         self.observer_agent_index = Some(agent_index);
+    }
+
+    /// Set the harness-side permission policy for subsequent ACP requests.
+    pub fn set_permission_mode(&mut self, permission_mode: PermissionMode) {
+        self.permission_mode = permission_mode;
     }
 
     /// Update metadata that will be attached to subsequent raw wire events.
@@ -1985,10 +1995,12 @@ impl AcpClient {
         }
     }
 
-    /// Auto-approve a `session/request_permission` request from the agent.
+    /// Resolve a `session/request_permission` request from the agent according
+    /// to the harness permission policy.
     ///
-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
-    /// If no `allow_once` option exists, falls back to `reject_once`.
+    /// `dontAsk` and `plan` select `reject_once` and fail closed if the adapter
+    /// did not provide one. Other modes retain the historical `allow_once`
+    /// behavior, falling back to `reject_once` if permission cannot be granted.
     ///
     /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
     ///
@@ -2016,39 +2028,35 @@ impl AcpClient {
             options.len()
         );
 
-        // Find allow_once by kind — NEVER hardcode optionId.
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
+        let reject_required = matches!(
+            self.permission_mode,
+            PermissionMode::DontAsk | PermissionMode::Plan
+        );
+        let option_id =
+            permission_option_for_mode(options, self.permission_mode).ok_or_else(|| {
+                let required = if reject_required {
+                    "reject_once"
+                } else {
+                    "allow_once or reject_once"
+                };
+                AcpError::Protocol(format!(
+                    "no suitable permission option found (required {required})"
+                ))
+            })?;
 
-        let response = if let Some(opt) = allow_once {
-            let option_id = opt["optionId"]
-                .as_str()
-                .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
+        let response = if reject_required {
+            tracing::info!(
+                target: "acp::permission",
+                mode = %self.permission_mode,
+                "rejecting permission id={id} with reject_once optionId={option_id:?}"
+            );
+            permission_response_selected(&id, option_id)
+        } else {
             tracing::info!(
                 target: "acp::permission",
                 "auto-approving permission id={id} with allow_once optionId={option_id:?}"
             );
             permission_response_selected(&id, option_id)
-        } else {
-            // No allow_once — fall back to reject_once.
-            tracing::warn!(
-                target: "acp::permission",
-                "no allow_once option found in permission request id={id}, falling back to reject_once"
-            );
-            let reject = options
-                .iter()
-                .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
-
-            if let Some(opt) = reject {
-                let option_id = opt["optionId"].as_str().unwrap_or("reject");
-                permission_response_selected(&id, option_id)
-            } else {
-                return Err(AcpError::Protocol(
-                    "no suitable permission option found (neither allow_once nor reject_once)"
-                        .into(),
-                ));
-            }
         };
 
         // Write the response first, then mark as responded.
@@ -2163,6 +2171,39 @@ fn steer_prompt_blocks(prompt_blocks: &[&str]) -> Vec<serde_json::Value> {
         .iter()
         .map(|text| serde_json::json!({ "type": "text", "text": text }))
         .collect()
+}
+
+/// Select a permission option without trusting adapter-specific option IDs.
+/// Fail closed for non-interactive modes: `dontAsk` and `plan` may select only
+/// an explicit one-shot rejection.
+fn permission_option_for_mode(
+    options: &[serde_json::Value],
+    permission_mode: PermissionMode,
+) -> Option<&str> {
+    let reject_required = matches!(
+        permission_mode,
+        PermissionMode::DontAsk | PermissionMode::Plan
+    );
+    let preferred_kind = if reject_required {
+        "reject_once"
+    } else {
+        "allow_once"
+    };
+
+    options
+        .iter()
+        .find(|option| option.get("kind").and_then(|kind| kind.as_str()) == Some(preferred_kind))
+        .and_then(|option| option.get("optionId").and_then(|id| id.as_str()))
+        .or_else(|| {
+            (!reject_required)
+                .then(|| {
+                    options.iter().find(|option| {
+                        option.get("kind").and_then(|kind| kind.as_str()) == Some("reject_once")
+                    })
+                })
+                .flatten()
+                .and_then(|option| option.get("optionId").and_then(|id| id.as_str()))
+        })
 }
 
 /// Build a JSON-RPC permission response with `outcome: "selected"`.
