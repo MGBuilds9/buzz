@@ -2468,6 +2468,7 @@ async fn tokio_main() -> Result<()> {
                         agent_name,
                         goose_system_prompt_supported: None,
                         protocol_version,
+                        reply_fallback: None,
                     };
                     pool.return_agent(agent);
                     tracing::info!(agent = rr.index, "respawn complete");
@@ -3113,11 +3114,13 @@ async fn tokio_main() -> Result<()> {
         };
 
         match pool_event {
-            Some(PoolEvent::Result(result)) => {
+            Some(PoolEvent::Result(mut result)) => {
                 // Stop typing indicator for the completed channel.
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
                 }
+                complete_reply_fallback(&mut result, &removed_channels, Some(&ctx.rest_client))
+                    .await;
                 if handle_prompt_result(
                     &mut pool,
                     &mut queue,
@@ -3832,6 +3835,33 @@ fn spawn_failure_notice(
         tokio::spawn(async move {
             pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
         });
+    }
+}
+
+/// Complete any harness-side ACP reply fallback before the agent can be
+/// returned to the idle pool. This ordering prevents the duplicate query from
+/// seeing messages produced by a later turn serviced by the same agent.
+async fn complete_reply_fallback(
+    result: &mut PromptResult,
+    removed_channels: &HashSet<Uuid>,
+    rest_client: Option<&relay::RestClient>,
+) {
+    let fallback = if matches!(&result.outcome, PromptOutcome::Ok(acp::StopReason::EndTurn)) {
+        result
+            .agent
+            .reply_fallback
+            .take()
+            .filter(|context| !removed_channels.contains(&context.channel_id))
+            .zip(result.agent.acp.take_turn_agent_message())
+            .filter(|(_, content)| !content.trim().is_empty())
+    } else {
+        result.agent.reply_fallback = None;
+        let _ = result.agent.acp.take_turn_agent_message();
+        None
+    };
+
+    if let (Some(rest), Some((context, content))) = (rest_client, fallback) {
+        pool::post_agent_reply_fallback(rest, &context, &content).await;
     }
 }
 
@@ -4662,6 +4692,7 @@ async fn initialize_agent_pool(
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
+                            reply_fallback: None,
                         }));
                     }
                     Ok(Err(e)) => {
@@ -7025,6 +7056,7 @@ mod error_outcome_emission_tests {
             // Error branches under test never read this; 1 is the legacy
             // non-systemPrompt path, the simplest valid value.
             protocol_version: 1,
+            reply_fallback: None,
         }
     }
 

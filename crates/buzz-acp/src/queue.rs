@@ -1266,6 +1266,58 @@ fn resolve_reply_anchor(
     )
 }
 
+/// Resolve the ordinary Buzz reply target for the newest event in a batch.
+///
+/// This is shared by prompt rendering and the harness-side publish fallback so
+/// both paths preserve the same human-facing thread shape.
+pub(crate) fn reply_anchor_for_batch(
+    batch: &FlushBatch,
+    channel_info: Option<&PromptChannelInfo>,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> Option<String> {
+    let last_event = batch.events.last()?;
+    let thread_tags = parse_thread_tags(&last_event.event);
+    let is_dm = channel_info
+        .map(|ci| ci.channel_type == "dm")
+        .unwrap_or(false);
+
+    if is_dm {
+        thread_tags
+            .root_event_id
+            .is_some()
+            .then(|| last_event.event.id.to_hex())
+    } else {
+        resolve_reply_anchor(
+            &last_event.event.pubkey.to_hex(),
+            &thread_tags,
+            &last_event.event.id.to_hex(),
+            profile_lookup,
+        )
+    }
+}
+
+/// Resolve the root and immediate parent used by the harness reply fallback.
+/// Ordinary channel replies retain the existing flattened human-facing shape.
+/// Nested DMs instead preserve the existing root while replying to the event
+/// that triggered this turn.
+pub(crate) fn reply_fallback_thread_for_batch(
+    batch: &FlushBatch,
+    channel_info: Option<&PromptChannelInfo>,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> (Option<String>, Option<String>) {
+    let parent_event_id = reply_anchor_for_batch(batch, channel_info, profile_lookup);
+    let is_dm = channel_info.is_some_and(|channel| channel.channel_type == "dm");
+    let root_event_id = if is_dm {
+        batch
+            .events
+            .last()
+            .and_then(|event| parse_thread_tags(&event.event).root_event_id)
+    } else {
+        parent_event_id.clone()
+    };
+    (root_event_id, parent_event_id)
+}
+
 /// Maximum length (in characters) of a channel description rendered into `[Context]`.
 ///
 /// Limits prompt bloat from unusually long descriptions; a raw embedded newline
@@ -1611,20 +1663,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //   - top-level     → anchor to the triggering event (it becomes the root)
     // Agent↔agent turns get no forced anchor — deep nesting is intentional
     // there. DMs are always 1:1 with a human, so they always anchor.
-    let sender_pubkey = last_event.event.pubkey.to_hex();
-    let reply_anchor = if is_dm {
-        thread_tags
-            .root_event_id
-            .is_some()
-            .then(|| last_event.event.id.to_hex())
-    } else {
-        resolve_reply_anchor(
-            &sender_pubkey,
-            &thread_tags,
-            &last_event.event.id.to_hex(),
-            args.profile_lookup,
-        )
-    };
+    let reply_anchor = reply_anchor_for_batch(batch, args.channel_info, args.profile_lookup);
     sections.push(format_context_hints(
         batch.channel_id,
         args.channel_info,
@@ -3214,6 +3253,45 @@ mod tests {
         let tags = parse_thread_tags(&event);
         assert_eq!(tags.root_event_id.as_deref(), Some("root123"));
         assert_eq!(tags.parent_event_id.as_deref(), Some("parent456"));
+    }
+
+    #[test]
+    fn reply_fallback_thread_preserves_nested_dm_root_and_trigger_parent() {
+        let root = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let previous_parent = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let event = make_event_with_tags(
+            "nested DM reply",
+            vec![
+                vec!["e".into(), root.into(), "".into(), "root".into()],
+                vec![
+                    "e".into(),
+                    previous_parent.into(),
+                    "".into(),
+                    "reply".into(),
+                ],
+            ],
+        );
+        let triggering_event_id = event.id.to_hex();
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let channel = PromptChannelInfo {
+            name: "dm".into(),
+            channel_type: "dm".into(),
+            description: None,
+        };
+
+        assert_eq!(
+            reply_fallback_thread_for_batch(&batch, Some(&channel), None),
+            (Some(root.into()), Some(triggering_event_id))
+        );
     }
 
     #[test]

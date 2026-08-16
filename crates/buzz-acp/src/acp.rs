@@ -22,6 +22,10 @@ use crate::usage::{
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// Buzz messages are limited to 64 KiB of UTF-8 content. The ACP fallback
+/// never retains more than a publishable message.
+const MAX_FALLBACK_MESSAGE_BYTES: usize = 64 * 1024;
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -214,6 +218,18 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
+    /// Text emitted in `agent_message_chunk` notifications for the current
+    /// `session/prompt` request. The harness uses this as a last-resort reply
+    /// body when an adapter cannot invoke the Buzz CLI itself.
+    turn_agent_message: String,
+    /// ACP message identifier for the retained assistant segment. A turn may
+    /// contain several model rounds separated by tools; only the final round
+    /// is safe to publish as the user-facing fallback.
+    turn_agent_message_id: Option<String>,
+    /// Set when the retained assistant segment exceeded Buzz's message limit.
+    /// Further chunks for that segment are ignored and no truncated fallback
+    /// is published.
+    turn_agent_message_overflowed: bool,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -563,6 +579,9 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
+            turn_agent_message: String::new(),
+            turn_agent_message_id: None,
+            turn_agent_message_overflowed: false,
         })
     }
 
@@ -781,6 +800,10 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        // A client can issue an initial-message prompt immediately before the
+        // user turn. Keep only the chunks emitted by this prompt so the
+        // harness fallback never republishes stale setup output.
+        self.reset_turn_agent_message();
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -1755,11 +1778,35 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
+                    if let Some(message_id) = update.get("messageId").and_then(|v| v.as_str()) {
+                        if self.turn_agent_message_id.as_deref() != Some(message_id) {
+                            self.reset_turn_agent_message();
+                            self.turn_agent_message_id = Some(message_id.to_string());
+                        }
+                    }
+                    if !self.turn_agent_message_overflowed {
+                        if text.len()
+                            <= MAX_FALLBACK_MESSAGE_BYTES
+                                .saturating_sub(self.turn_agent_message.len())
+                        {
+                            self.turn_agent_message.push_str(text);
+                        } else {
+                            self.turn_agent_message.clear();
+                            self.turn_agent_message_overflowed = true;
+                            tracing::warn!(
+                                limit = MAX_FALLBACK_MESSAGE_BYTES,
+                                "ACP reply exceeded Buzz message limit — dropping reply fallback"
+                            );
+                        }
+                    }
                     tracing::info!(target: "acp::stream", "{text}");
                 }
                 false
             }
             "tool_call" => {
+                // Text before a tool call is intermediate narration, not the
+                // final answer. Retain only chunks emitted after the last tool.
+                self.reset_turn_agent_message();
                 let title = update
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -1851,6 +1898,22 @@ impl AcpClient {
                 false
             }
         }
+    }
+
+    fn reset_turn_agent_message(&mut self) {
+        self.turn_agent_message.clear();
+        self.turn_agent_message_id = None;
+        self.turn_agent_message_overflowed = false;
+    }
+
+    /// Take the publishable text emitted by the most recent `session/prompt`
+    /// turn. Returns `None` after an oversized final segment so callers fail
+    /// closed instead of publishing a truncated reply.
+    pub(crate) fn take_turn_agent_message(&mut self) -> Option<String> {
+        let message = (!self.turn_agent_message_overflowed)
+            .then(|| std::mem::take(&mut self.turn_agent_message));
+        self.reset_turn_agent_message();
+        message
     }
 
     /// Record the standard ACP cumulative cost notification when emitted by
@@ -3073,6 +3136,109 @@ mod tests {
             matches!(result, Err(AcpError::IdleTimeout(_))),
             "expected IdleTimeout, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_agent_message_is_accumulated_and_reset_per_turn() {
+        let script = r#"
+            read -r _first_prompt
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"hello "}}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"world"}}}}'
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+            read -r _second_prompt
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"next"}}}}'
+            echo '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'
+        "#;
+        let mut client = spawn_script(script).await;
+        let idle = std::time::Duration::from_secs(2);
+        let hard = std::time::Duration::from_secs(5);
+
+        assert!(matches!(
+            client
+                .session_prompt_with_idle_timeout("session", "first", idle, hard)
+                .await,
+            Ok(StopReason::EndTurn)
+        ));
+        assert_eq!(
+            client.take_turn_agent_message().as_deref(),
+            Some("hello world")
+        );
+
+        assert!(matches!(
+            client
+                .session_prompt_with_idle_timeout("session", "second", idle, hard)
+                .await,
+            Ok(StopReason::EndTurn)
+        ));
+        assert_eq!(client.take_turn_agent_message().as_deref(), Some("next"));
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prompt_agent_message_keeps_only_final_segment_after_tool_and_message_change() {
+        let script = r#"
+            read -r _prompt
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"round-1","content":{"text":"I will inspect this."}}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","title":"inspect","kind":"other"}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"round-2","content":{"text":"Final "}}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"round-2","content":{"text":"answer"}}}}'
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+        "#;
+        let mut client = spawn_script(script).await;
+
+        assert!(matches!(
+            client
+                .session_prompt_with_idle_timeout(
+                    "session",
+                    "prompt",
+                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_secs(5),
+                )
+                .await,
+            Ok(StopReason::EndTurn)
+        ));
+        assert_eq!(
+            client.take_turn_agent_message().as_deref(),
+            Some("Final answer")
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prompt_agent_message_accepts_exact_buzz_limit_and_drops_overflow() {
+        let mut client = spawn_script("sleep 10").await;
+
+        client.handle_session_update(&serde_json::json!({
+            "params": {"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "at-limit",
+                "content": {"text": "x".repeat(MAX_FALLBACK_MESSAGE_BYTES)}
+            }}
+        }));
+        assert_eq!(
+            client
+                .take_turn_agent_message()
+                .map(|message| message.len()),
+            Some(MAX_FALLBACK_MESSAGE_BYTES)
+        );
+
+        client.handle_session_update(&serde_json::json!({
+            "params": {"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "overflow",
+                "content": {"text": "x".repeat(MAX_FALLBACK_MESSAGE_BYTES)}
+            }}
+        }));
+        client.handle_session_update(&serde_json::json!({
+            "params": {"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "overflow",
+                "content": {"text": "y"}
+            }}
+        }));
+        assert_eq!(client.turn_agent_message.len(), 0);
+        assert!(client.take_turn_agent_message().is_none());
+        client.shutdown().await;
     }
 
     #[tokio::test]
